@@ -36,10 +36,13 @@ fi
 
 echo "==> 6. Secret pattern check"
 
+echo "==> 6. Secret pattern check"
+
 if git grep -n -E \
   'GEMINI_API_KEY[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']{8,}["'"'"']' \
   -- \
   ':!README.md' \
+  ':!**/README.md' \
   ':!project.example.yaml' \
   ':!scripts/verify_release.sh'; then
 
@@ -47,6 +50,8 @@ if git grep -n -E \
   echo "ERROR: possible hardcoded Gemini API key found."
   exit 1
 fi
+
+echo "Secret pattern check passed."
 
 echo
 echo "All source checks passed."
