@@ -5,7 +5,6 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .pipeline import process
 from .utils import prefer_ffmpeg_full
 
 
@@ -24,8 +23,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "project",
         nargs="?",
+        help="Project directory or project.yaml path",
+    )
+
+    parser.add_argument(
+        "--detect-only",
+        action="store_true",
         help=(
-            "Project directory or project.yaml path"
+            "Detect narration content boundaries only, "
+            "without trimming, transcription, or rendering."
         ),
     )
 
@@ -41,9 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help=(
-            "Ignore cached processing results."
-        ),
+        help="Ignore cached processing results.",
     )
 
     parser.add_argument(
@@ -56,26 +60,37 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    prefer_ffmpeg_full()
-    
     parser = build_parser()
     args = parser.parse_args()
 
     if not args.project:
+        parser.error("a project directory is required")
+
+    if args.detect_only and args.audio_only:
         parser.error(
-            "a project directory is required"
+            "--detect-only and --audio-only cannot be used together"
         )
 
     try:
-        cfg = load_config(
-            Path(args.project)
-        )
+        # Do not initialize FFmpeg or import the heavy processing
+        # pipeline for --help / --version.
+        prefer_ffmpeg_full()
 
-        output = process(
-            cfg,
-            force=args.force,
-            audio_only=args.audio_only,
-        )
+        from .pipeline import detect_only, process
+
+        cfg = load_config(Path(args.project))
+
+        if args.detect_only:
+            output = detect_only(
+                cfg,
+                force=args.force,
+            )
+        else:
+            output = process(
+                cfg,
+                force=args.force,
+                audio_only=args.audio_only,
+            )
 
         print()
         print(f"Done: {output}")

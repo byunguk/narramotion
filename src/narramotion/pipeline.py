@@ -23,9 +23,32 @@ def process(
         require_ffmpeg_subtitles()
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
 
+    if not cfg.audio_dir.is_dir():
+        raise RuntimeError(
+            f"Audio directory not found: {cfg.audio_dir}"
+        )
+
     sources = audio_files(cfg.audio_dir)
+
     if not sources:
-        raise RuntimeError(f"No audio files found in {cfg.audio_dir}")
+        raise RuntimeError(
+            f"No audio files found in {cfg.audio_dir}"
+        )
+
+    images: list[Path] = []
+
+    if not audio_only:
+        if not cfg.image_dir.is_dir():
+            raise RuntimeError(
+                f"Image directory not found: {cfg.image_dir}"
+            )
+
+        images = image_files(cfg.image_dir)
+
+        if not images:
+            raise RuntimeError(
+                f"No images found in {cfg.image_dir}"
+            )
 
     trimmed_dir = cfg.work_dir / "trimmed"
     detect_dir = cfg.work_dir / "detections"
@@ -55,9 +78,20 @@ def process(
 
         if detection_path.exists() and not force:
             detection = load_json(detection_path)
-            print("    detection: cached")
 
+            # Older cache files may contain start-only detection data.
+            # Rebuild them so process() always has both boundaries.
+            if (
+                "reading_start_sec" in detection
+                and "reading_end_sec" in detection
+            ):
+                print("    detection: cached")
+            else:
+                detection = None
         else:
+            detection = None
+
+        if detection is None:
             print("    detecting start...")
 
             start_detection = detect_reading_start(
@@ -91,35 +125,27 @@ def process(
                 "reading_end_sec": float(
                     end_detection["reading_end_sec"]
                 ),
-
                 "detected_book": start_detection.get(
                     "detected_book"
                 ),
-
                 "detected_chapter": start_detection.get(
                     "detected_chapter"
                 ),
-
                 "opening_words": start_detection.get(
                     "opening_words"
                 ),
-
                 "closing_words": end_detection.get(
                     "closing_words"
                 ),
-
                 "start_confidence": float(
                     start_detection.get("confidence", 0)
                 ),
-
                 "end_confidence": float(
                     end_detection.get("confidence", 0)
                 ),
-
                 "start_reason": start_detection.get(
                     "reason"
                 ),
-
                 "end_reason": end_detection.get(
                     "reason"
                 ),
@@ -391,13 +417,6 @@ def process(
 
     total_duration = duration(narration)
 
-    images = image_files(cfg.image_dir)
-
-    if not images:
-        raise RuntimeError(
-            f"No images found in {cfg.image_dir}"
-        )
-
     clips = render_image_clips(
         images,
         total_duration,
@@ -467,11 +486,22 @@ def detect_only(cfg: Config, *, force: bool = False) -> Path:
     require_binary("ffprobe")
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
 
+    # Validate required inputs before doing expensive AI/audio work.
+    if not cfg.audio_dir.is_dir():
+        raise RuntimeError(
+            f"Audio directory not found: {cfg.audio_dir}"
+        )
+
     sources = audio_files(cfg.audio_dir)
+
     if not sources:
-        raise RuntimeError(f"No audio files found in {cfg.audio_dir}")
+        raise RuntimeError(
+            f"No audio files found in {cfg.audio_dir}"
+        )
 
     detect_dir = cfg.work_dir / "detections"
+    detect_dir.mkdir(parents=True, exist_ok=True)
+
     review: list[dict] = []
     summary: list[dict] = []
 
@@ -483,37 +513,107 @@ def detect_only(cfg: Config, *, force: bool = False) -> Path:
 
         if detection_path.exists() and not force:
             detection = load_json(detection_path)
-            cached = True
+
+            # Older cache files may contain start-only detection data.
+            # Rebuild them so --detect-only always reports both boundaries.
+            if (
+                "reading_start_sec" in detection
+                and "reading_end_sec" in detection
+            ):
+                cached = True
+            else:
+                detection = None
         else:
-            detection = detect_reading_start(
+            detection = None
+
+        if detection is None:
+            print("    detecting start...")
+            start_detection = detect_reading_start(
                 src,
                 cfg.detection_window_sec,
                 cfg.detection_model,
             )
+
+            print("    detecting end...")
+            end_detection = detect_reading_end(
+                src,
+                cfg.detection_window_sec,
+                cfg.detection_model,
+            )
+
+            detection = {
+                "reading_start_sec": float(
+                    start_detection["reading_start_sec"]
+                ),
+                "reading_end_sec": float(
+                    end_detection["reading_end_sec"]
+                ),
+                "detected_book": start_detection.get("detected_book"),
+                "detected_chapter": start_detection.get("detected_chapter"),
+                "opening_words": start_detection.get("opening_words"),
+                "closing_words": end_detection.get("closing_words"),
+                "start_confidence": float(
+                    start_detection.get("confidence", 0)
+                ),
+                "end_confidence": float(
+                    end_detection.get("confidence", 0)
+                ),
+                "start_reason": start_detection.get("reason"),
+                "end_reason": end_detection.get("reason"),
+            }
+
             save_json(detection_path, detection)
             cached = False
 
-        confidence = float(detection.get("confidence", 0))
         reading_start = float(detection["reading_start_sec"])
+        reading_end = float(detection["reading_end_sec"])
+
+        start_confidence = float(
+            detection.get(
+                "start_confidence",
+                detection.get("confidence", 0),
+            )
+        )
+        end_confidence = float(
+            detection.get(
+                "end_confidence",
+                detection.get("confidence", 0),
+            )
+        )
+
+        source_duration = duration(src)
+        trim_start = max(
+            0.0,
+            reading_start - cfg.trim_preroll_sec,
+        )
+        trim_end = min(
+            source_duration,
+            reading_end + 0.20,
+        )
 
         item = {
             "file": src.name,
             "reading_start_sec": reading_start,
-            "trim_start_sec": max(
-                0.0,
-                reading_start - cfg.trim_preroll_sec,
-            ),
+            "reading_end_sec": reading_end,
+            "trim_start_sec": trim_start,
+            "trim_end_sec": trim_end,
             "detected_book": detection.get("detected_book"),
             "detected_chapter": detection.get("detected_chapter"),
             "opening_words": detection.get("opening_words"),
-            "confidence": confidence,
-            "reason": detection.get("reason"),
+            "closing_words": detection.get("closing_words"),
+            "start_confidence": start_confidence,
+            "end_confidence": end_confidence,
+            "start_reason": detection.get("start_reason"),
+            "end_reason": detection.get("end_reason"),
             "cached": cached,
         }
 
         summary.append(item)
 
-        if confidence < cfg.confidence_threshold:
+        if (
+            start_confidence < cfg.confidence_threshold
+            or end_confidence < cfg.confidence_threshold
+        ):
             review.append(item)
 
         book = detection.get("detected_book") or "?"
@@ -523,8 +623,9 @@ def detect_only(cfg: Config, *, force: bool = False) -> Path:
         print(
             f"    {book} {chapter} | "
             f"start={reading_start:.2f}s | "
-            f"trim={item['trim_start_sec']:.2f}s | "
-            f"confidence={confidence:.2f}"
+            f"end={reading_end:.2f}s | "
+            f"trim={trim_start:.2f}s->{trim_end:.2f}s | "
+            f"confidence={start_confidence:.2f}/{end_confidence:.2f}"
             f"{cache_label}"
         )
 
