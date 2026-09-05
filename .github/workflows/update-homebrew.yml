@@ -16,6 +16,9 @@ jobs:
     runs-on: macos-14
 
     steps:
+      - name: Checkout Narramotion
+        uses: actions/checkout@v4
+
       - name: Download release asset
         env:
           GH_TOKEN: ${{ github.token }}
@@ -24,6 +27,7 @@ jobs:
           mkdir -p release
 
           gh release download "v${VERSION}" \
+            --repo byunguk/narramotion \
             --pattern "narramotion-${VERSION}-macos-arm64.tar.gz" \
             --dir release
 
