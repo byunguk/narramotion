@@ -1,0 +1,36 @@
+dirs:
+  audio: ./audio
+  images: ./images
+  music: ./music
+  work: ./.narramotion
+  output: ./output/final.mp4
+
+audio:
+  detection_window_sec: 90
+  detection_model: gemini-3.7-flash
+  transcribe_model: gemini-3.5-transcribe
+  language_code: en-US
+  confidence_threshold: 0.90
+  trim_preroll_sec: 0.30
+  volume: 1.0
+
+subtitles:
+  max_words: 9
+  max_sec: 4.0
+
+images:
+  duration_sec: 10
+  overscan: 1.06
+  # 0.0 in v0.1.0. Image clips are concatenated for predictable low-memory rendering.
+  transition_sec: 0.0
+
+music:
+  volume: 0.10
+
+video:
+  width: 1920
+  height: 1080
+  fps: 30
+  codec: libx264
+  crf: 20
+  preset: medium

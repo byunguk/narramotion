@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# Narramotion generated/cache
+.narramotion/
+output/
+
+# Root-level local test assets
+audio/
+images/
+music/
+audio-test/
+
+# Per-project source assets and generated files
+projects/*/audio/
+projects/*/images/
+projects/*/music/
+projects/*/.narramotion/
+projects/*/output/
+
+# Local project configuration
+project.yaml
+projects/*/project.yaml
+projects/*/project.yml
