@@ -47,16 +47,90 @@ jobs:
         run: |
           ./scripts/package_release.sh "${{ inputs.version }}"
 
+      - name: Compute SHA256
+        id: sha
+        run: |
+          FILE="dist/narramotion-${{ inputs.version }}-macos-arm64.tar.gz"
+          SHA="$(shasum -a 256 "$FILE" | awk '{print $1}')"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "SHA256: $SHA"
+
       - name: Create tag
         run: |
-          git tag "v${{ inputs.version }}"
-          git push origin "v${{ inputs.version }}"
+          TAG="v${{ inputs.version }}"
 
-      - name: Create GitHub Release
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists."
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v${{ inputs.version }}" \
-            "dist/narramotion-${{ inputs.version }}-macos-arm64.tar.gz" \
-            --title "Narramotion ${{ inputs.version }}" \
-            --generate-notes
+          TAG="v${{ inputs.version }}"
+          FILE="dist/narramotion-${{ inputs.version }}-macos-arm64.tar.gz"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Uploading asset..."
+            gh release upload "$TAG" "$FILE" --clobber
+          else
+            gh release create "$TAG" \
+              "$FILE" \
+              --title "Narramotion ${{ inputs.version }}" \
+              --generate-notes
+          fi
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: byunguk/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Narramotion Cask
+        env:
+          VERSION: ${{ inputs.version }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          mkdir -p homebrew-tap/Casks
+
+          cat > homebrew-tap/Casks/narramotion.rb <<EOF
+          cask "narramotion" do
+            version "${VERSION}"
+            sha256 "${SHA256}"
+
+            url "https://github.com/byunguk/narramotion/releases/download/v#{version}/narramotion-#{version}-macos-arm64.tar.gz"
+
+            name "Narramotion"
+            desc "Turn narration audio, images, and music into subtitled videos"
+            homepage "https://github.com/byunguk/narramotion"
+
+            depends_on arch: :arm64
+            depends_on formula: "ffmpeg-full"
+
+            binary "narramotion/narramotion"
+
+            zap trash: [
+              "~/.cache/narramotion",
+            ]
+          end
+          EOF
+
+      - name: Push Homebrew Cask
+        working-directory: homebrew-tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Casks/narramotion.rb
+
+          if git diff --cached --quiet; then
+            echo "No Homebrew changes."
+            exit 0
+          fi
+
+          git commit -m "Update Narramotion to ${{ inputs.version }}"
+          git push
