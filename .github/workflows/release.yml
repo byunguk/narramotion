@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. 0.1.0)"
+        description: "Release version (e.g. 0.1.2)"
         required: true
         type: string
 
@@ -13,94 +13,339 @@ permissions:
 
 jobs:
   release-macos-arm64:
+    name: Release macOS arm64
     runs-on: macos-14
 
+    env:
+      APPLE_TEAM_ID: "4ANJ4SUYK4"
+      APPLE_CODESIGN_IDENTITY: "Developer ID Application: Gndsoft LLC (4ANJ4SUYK4)"
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
+
+      - name: Checkout Narramotion
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # ------------------------------------------------------------
+      # 2. Python
+      # ------------------------------------------------------------
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e .
-          pip install pytest pyinstaller
+          pip install -e '.[dev]'
+          pip install pyinstaller
+
+      # ------------------------------------------------------------
+      # 3. Validate requested version
+      # ------------------------------------------------------------
+
+      - name: Validate version
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          PROJECT_VERSION="$(python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          print(data["project"]["version"])
+          PY
+          )"
+
+          echo "Workflow version: ${RELEASE_VERSION}"
+          echo "Project version:  ${PROJECT_VERSION}"
+
+          if [[ "$PROJECT_VERSION" != "$RELEASE_VERSION" ]]; then
+            echo "ERROR: workflow version does not match pyproject.toml"
+            exit 1
+          fi
+
+      # ------------------------------------------------------------
+      # 4. Verify source
+      # ------------------------------------------------------------
 
       - name: Verify source
         run: |
           ./scripts/verify_release.sh
 
+      # ------------------------------------------------------------
+      # 5. Build PyInstaller onedir
+      # ------------------------------------------------------------
+
       - name: Build
         run: |
           ./scripts/build_macos.sh
 
-      - name: Test standalone
+      # ------------------------------------------------------------
+      # 6. Install Developer ID certificate into temporary Keychain
+      #
+      # Required secrets:
+      #
+      # APPLE_CERTIFICATE_BASE64
+      # APPLE_CERTIFICATE_PASSWORD
+      # ------------------------------------------------------------
+
+      - name: Import Apple Developer ID certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/narramotion-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+
+          export CERTIFICATE_PATH
+
+          python - <<'PY'
+          import base64
+          import os
+
+          certificate = base64.b64decode(
+              os.environ["APPLE_CERTIFICATE_BASE64"]
+          )
+
+          with open(os.environ["CERTIFICATE_PATH"], "wb") as f:
+              f.write(certificate)
+          PY
+
+          security create-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security set-keychain-settings \
+            -lut 21600 \
+            "$KEYCHAIN_PATH"
+
+          security unlock-keychain \
+            -p "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security default-keychain \
+            -s "$KEYCHAIN_PATH"
+
+          security find-identity \
+            -v \
+            -p codesigning \
+            "$KEYCHAIN_PATH"
+
+      # ------------------------------------------------------------
+      # 7. Sign
+      # ------------------------------------------------------------
+
+      - name: Sign Narramotion
+        run: |
+          ./scripts/sign_macos.sh
+
+      # ------------------------------------------------------------
+      # 8. Verify signature
+      # ------------------------------------------------------------
+
+      - name: Verify signature
+        run: |
+          codesign \
+            --verify \
+            --deep \
+            --strict \
+            --verbose=4 \
+            dist/narramotion/narramotion
+
+          codesign \
+            -dvvv \
+            dist/narramotion/narramotion \
+            2>&1
+
+      # ------------------------------------------------------------
+      # 9. Smoke-test signed executable
+      # ------------------------------------------------------------
+
+      - name: Test signed standalone
         run: |
           ./dist/narramotion/narramotion --version
-          ./dist/narramotion/narramotion --help
+          ./dist/narramotion/narramotion --help >/dev/null
 
-      - name: Package
+      # ------------------------------------------------------------
+      # 10. Create notarization ZIP
+      #
+      # This ZIP is only for Apple notarization.
+      # It is NOT the Homebrew release artifact.
+      # ------------------------------------------------------------
+
+      - name: Create notarization archive
+        run: |
+          rm -f dist/narramotion-notarize.zip
+
+          ditto \
+            -c \
+            -k \
+            --keepParent \
+            dist/narramotion \
+            dist/narramotion-notarize.zip
+
+      # ------------------------------------------------------------
+      # 11. Apple notarization
+      #
+      # Required secrets:
+      #
+      # APPLE_ID
+      # APPLE_APP_SPECIFIC_PASSWORD
+      # ------------------------------------------------------------
+
+      - name: Notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          xcrun notarytool submit \
+            dist/narramotion-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      # ------------------------------------------------------------
+      # 12. Package the exact signed + notarized build
+      #
+      # IMPORTANT:
+      # Do NOT rebuild after notarization.
+      # ------------------------------------------------------------
+
+      - name: Package release
         run: |
           ./scripts/package_release.sh "${{ inputs.version }}"
 
+      # ------------------------------------------------------------
+      # 13. Compute SHA256
+      # ------------------------------------------------------------
+
       - name: Compute SHA256
         id: sha
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          FILE="dist/narramotion-${{ inputs.version }}-macos-arm64.tar.gz"
+          FILE="dist/narramotion-${RELEASE_VERSION}-macos-arm64.tar.gz"
+
+          if [[ ! -f "$FILE" ]]; then
+            echo "ERROR: Release artifact not found: $FILE"
+            exit 1
+          fi
+
           SHA="$(shasum -a 256 "$FILE" | awk '{print $1}')"
+
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
-          echo "SHA256: $SHA"
+
+          echo
+          echo "Artifact: $FILE"
+          echo "SHA256:   $SHA"
+
+      # ------------------------------------------------------------
+      # 14. Create version tag
+      #
+      # Safe to rerun if the tag already points to this commit.
+      # ------------------------------------------------------------
 
       - name: Create tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          TAG="v${{ inputs.version }}"
+          TAG="v${RELEASE_VERSION}"
+
+          git fetch --tags --force
 
           if git rev-parse "$TAG" >/dev/null 2>&1; then
-            echo "Tag $TAG already exists."
+            TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
+            CURRENT_COMMIT="$(git rev-parse HEAD)"
+
+            if [[ "$TAG_COMMIT" != "$CURRENT_COMMIT" ]]; then
+              echo "ERROR: $TAG already exists on another commit."
+              echo "Tag:     $TAG_COMMIT"
+              echo "Current: $CURRENT_COMMIT"
+              exit 1
+            fi
+
+            echo "$TAG already exists on this commit."
           else
             git tag "$TAG"
             git push origin "$TAG"
           fi
 
+      # ------------------------------------------------------------
+      # 15. Create/update GitHub Release
+      # ------------------------------------------------------------
+
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          TAG="v${{ inputs.version }}"
-          FILE="dist/narramotion-${{ inputs.version }}-macos-arm64.tar.gz"
+          TAG="v${RELEASE_VERSION}"
+          FILE="dist/narramotion-${RELEASE_VERSION}-macos-arm64.tar.gz"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists. Uploading asset..."
-            gh release upload "$TAG" "$FILE" --clobber
-          else
-            gh release create "$TAG" \
+            echo "Release $TAG already exists."
+            echo "Replacing release asset..."
+
+            gh release upload \
+              "$TAG" \
               "$FILE" \
-              --title "Narramotion ${{ inputs.version }}" \
+              --clobber
+          else
+            gh release create \
+              "$TAG" \
+              "$FILE" \
+              --title "Narramotion ${RELEASE_VERSION}" \
               --generate-notes
           fi
 
+      # ------------------------------------------------------------
+      # 16. Checkout Homebrew tap
+      # ------------------------------------------------------------
+
       - name: Checkout Homebrew tap
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: byunguk/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
           path: homebrew-tap
 
+      # ------------------------------------------------------------
+      # 17. Generate Cask
+      # ------------------------------------------------------------
+
       - name: Update Narramotion Cask
         env:
-          VERSION: ${{ inputs.version }}
-          SHA256: ${{ steps.sha.outputs.sha256 }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_SHA256: ${{ steps.sha.outputs.sha256 }}
         run: |
           mkdir -p homebrew-tap/Casks
 
           cat > homebrew-tap/Casks/narramotion.rb <<EOF
           cask "narramotion" do
-            version "${VERSION}"
-            sha256 "${SHA256}"
+            version "${RELEASE_VERSION}"
+            sha256 "${RELEASE_SHA256}"
 
             url "https://github.com/byunguk/narramotion/releases/download/v#{version}/narramotion-#{version}-macos-arm64.tar.gz"
 
@@ -114,23 +359,55 @@ jobs:
             binary "narramotion/narramotion"
 
             zap trash: [
+              "~/.config/narramotion",
               "~/.cache/narramotion",
             ]
           end
           EOF
 
+          echo
+          echo "Generated Cask:"
+          cat homebrew-tap/Casks/narramotion.rb
+
+      # ------------------------------------------------------------
+      # 18. Commit + push Homebrew Cask
+      # ------------------------------------------------------------
+
       - name: Push Homebrew Cask
         working-directory: homebrew-tap
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add Casks/narramotion.rb
 
           if git diff --cached --quiet; then
-            echo "No Homebrew changes."
+            echo "Homebrew Cask is already up to date."
             exit 0
           fi
 
-          git commit -m "Update Narramotion to ${{ inputs.version }}"
+          git commit \
+            -m "Update Narramotion to ${{ inputs.version }}"
+
           git push
+
+      # ------------------------------------------------------------
+      # 19. Summary
+      # ------------------------------------------------------------
+
+      - name: Release summary
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          echo "=========================================="
+          echo "Narramotion release complete"
+          echo "=========================================="
+          echo
+          echo "Version:      ${RELEASE_VERSION}"
+          echo "Architecture: arm64"
+          echo "SHA256:       ${RELEASE_SHA256}"
+          echo
+          echo "Install:"
+          echo "brew install --cask byunguk/tap/narramotion"
