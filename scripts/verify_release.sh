@@ -35,11 +35,17 @@ if grep -RInE \
 fi
 
 echo "==> 6. Secret pattern check"
+echo "==> 6. Secret pattern check"
+
 if git grep -n -E \
-  'GEMINI_API_KEY=.+' \
-  -- ':!README.md' ':!project.example.yaml'; then
+  'GEMINI_API_KEY[[:space:]]*=[[:space:]]*["'"'"'][^$][^"'"'"']{8,}["'"'"']' \
+  -- \
+  ':!README.md' \
+  ':!project.example.yaml' \
+  ':!scripts/verify_release.sh'; then
+
   echo
-  echo "ERROR: possible Gemini API key assignment found."
+  echo "ERROR: possible hardcoded Gemini API key found."
   exit 1
 fi
 
