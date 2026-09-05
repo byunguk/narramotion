@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos-arm64:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pyinstaller
+
+      - name: Verify source
+        run: |
+          ./scripts/verify_release.sh
+
+      - name: Build
+        run: |
+          ./scripts/build_macos.sh
+
+      - name: Test standalone
+        run: |
+          ./dist/narramotion/narramotion --version
+          ./dist/narramotion/narramotion --help
+
+      - name: Package
+        run: |
+          ./scripts/package_release.sh "${{ inputs.version }}"
+
+      - name: Create tag
+        run: |
+          git tag "v${{ inputs.version }}"
+          git push origin "v${{ inputs.version }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            "dist/narramotion-${{ inputs.version }}-macos-arm64.tar.gz" \
+            --title "Narramotion ${{ inputs.version }}" \
+            --generate-notes
