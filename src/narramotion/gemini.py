@@ -14,11 +14,51 @@ from google.genai import types
 
 from .utils import parse_offset, run
 
+def _load_saved_api_key() -> str | None:
+    config_path = (
+        Path.home()
+        / ".config"
+        / "narramotion"
+        / "config.json"
+    )
+
+    if not config_path.exists():
+        return None
+
+    try:
+        data = json.loads(
+            config_path.read_text(
+                encoding="utf-8"
+            )
+        )
+    except Exception:
+        return None
+
+    value = data.get("gemini_api_key")
+
+    if not isinstance(value, str):
+        return None
+
+    value = value.strip()
+
+    return value or None
+
 
 def _client() -> genai.Client:
-    if not os.getenv("GEMINI_API_KEY"):
-        raise RuntimeError("GEMINI_API_KEY is not set")
-    return genai.Client()
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        api_key = _load_saved_api_key()
+
+    if not api_key:
+        raise RuntimeError(
+            "Gemini API key is not configured. "
+            "Run: narramotion init"
+        )
+
+    return genai.Client(
+        api_key=api_key
+    )
 
 
 def _extract_json(text: str) -> dict[str, Any]:
