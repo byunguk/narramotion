@@ -168,149 +168,239 @@ def detect_reading_end(
     window_sec: float,
     model: str,
 ) -> dict[str, Any]:
+    """
+    Analyze only the end portion of an audio file and locate where the
+    actual narration/scripture ends.
+
+    Gemini timestamps are relative to the tail preview clip.
+    This function converts them back to absolute timestamps in the
+    original audio file.
+    """
+
     client = _client()
 
-    total_duration = _audio_duration(audio_path)
-    tail_start = max(0.0, total_duration - window_sec)
+    # ------------------------------------------------------------
+    # 1. Get original audio duration
+    # ------------------------------------------------------------
+
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(audio_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    output = result.stdout.strip()
+
+    if not output:
+        raise RuntimeError(
+            f"Could not determine duration of {audio_path.name}"
+        )
+
+    total_duration = float(output)
+
+    # ------------------------------------------------------------
+    # 2. Calculate tail preview range
+    # ------------------------------------------------------------
+
+    preview_duration = min(
+        float(window_sec),
+        total_duration,
+    )
+
+    tail_start = max(
+        0.0,
+        total_duration - preview_duration,
+    )
+
+    # ------------------------------------------------------------
+    # 3. Extract tail preview
+    # ------------------------------------------------------------
 
     with tempfile.TemporaryDirectory(
-        prefix="narramotion-end-detect-"
+        prefix="narramotion-end-"
     ) as td:
         preview = Path(td) / "tail.mp3"
 
         run([
             "ffmpeg",
             "-y",
-            "-v", "error",
-            "-ss", f"{tail_start:.3f}",
-            "-i", str(audio_path),
-            "-t", f"{window_sec:.3f}",
+            "-v",
+            "error",
+            "-ss",
+            f"{tail_start:.3f}",
+            "-i",
+            str(audio_path),
+            "-t",
+            f"{preview_duration:.3f}",
             "-vn",
-            "-c:a", "libmp3lame",
-            "-q:a", "4",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "4",
             str(preview),
         ])
 
-        uploaded = client.files.upload(file=str(preview))
+        uploaded = client.files.upload(
+            file=str(preview)
+        )
 
-        prompt = """
-You are given an audio clip containing the FINAL portion of a narrated Bible reading.
+        # --------------------------------------------------------
+        # 4. Ask Gemini for a timestamp RELATIVE TO THIS CLIP
+        # --------------------------------------------------------
+
+        prompt = f"""
+You are analyzing ONLY the final {preview_duration:.3f} seconds of a narration audio file.
 
 IMPORTANT TIMESTAMP RULE:
 
-The supplied audio clip starts at timestamp 0.000 seconds.
+The audio clip provided to you starts at 0.000 seconds.
 
-Ignore any timestamp or timing from the original source recording.
+ALL timestamps you return MUST be relative to THIS PROVIDED CLIP.
 
-All timestamps you return MUST be relative to THIS supplied audio clip.
+Do NOT return a timestamp from the original full audio file.
 
-Therefore:
+Your valid timestamp range is:
 
-- the first sound in this supplied clip = 0.000 seconds
-- reading_end_sec MUST be >= 0
-- reading_end_sec MUST NOT exceed the duration of this supplied clip
+0.000 to {preview_duration:.3f} seconds
 
-Your task is to determine where the actual Scripture reading ends.
+The end of the audio may contain spoken material such as:
 
-The audio may contain spoken closing material after the Scripture, for example:
+- "End of Chapter 1"
+- "End of Chapter 1 to 3"
+- chapter announcements
+- narrator or reader credits
+- recording credits
+- publisher information
+- copyright notices
+- website or organization names
+- closing metadata
+- other non-narrative closing material
 
-"End of Chapter 1 to 3"
+Your task is to locate the END OF THE ACTUAL NARRATION CONTENT.
 
-or:
+For Bible audiobook material, identify the point immediately after the
+final spoken word of the actual Scripture text and BEFORE any closing
+announcement such as "End of Chapter".
 
-"End of Chapter 4"
+For example:
 
-It may also contain other closing announcements, credits, narrator information,
-publisher information, website names, copyright information, or metadata.
+"... Grace be with you. Amen.
+End of Chapter 1."
 
-These closing statements are NOT part of the Scripture.
+The returned timestamp should point immediately after "Amen" and before
+"End of Chapter 1".
 
-Find the LAST spoken word that belongs to the actual Scripture text.
+If there is no spoken closing metadata, return the end of the actual
+narration.
 
-Set reading_end_sec to the point immediately AFTER that final Scripture word
-and BEFORE the first word of any closing announcement or metadata.
+Return ONLY JSON with exactly these keys:
 
-Example:
-
-If this supplied clip contains:
-
-[0:00 ...]
-"... grace be with thee. Amen.
-End of Chapter 1 to 3."
-
-and "Amen" finishes at 84.2 seconds while "End" begins at 85.0 seconds,
-
-return approximately:
-
-{
-  "reading_end_sec": 84.2,
-  "closing_words": "grace be with thee. Amen.",
-  "following_words": "End of Chapter 1 to 3",
-  "confidence": 0.99,
-  "reason": "The Scripture reading ends after Amen; the following phrase is a closing announcement."
-}
-
-Do NOT return the timestamp where the closing announcement finishes.
-
-Do NOT return a timestamp from the original recording.
-
-Do NOT include "End of..." or any other closing announcement in the Scripture.
-
-If there is silence between the final Scripture word and the closing announcement,
-reading_end_sec should be at the END OF THE FINAL SCRIPTURE WORD,
-not at the end of the silence.
-
-Return ONLY valid JSON with exactly these keys:
-
-{
+{{
   "reading_end_sec": number,
   "closing_words": string,
-  "following_words": string,
-  "confidence": number,
+  "confidence": number from 0 to 1,
   "reason": string
-}
+}}
 
-No markdown.
-No code fences.
+"reading_end_sec" MUST be measured from the beginning of THIS PROVIDED
+CLIP, where the clip begins at 0.000 seconds.
+
+Do not use markdown.
 """.strip()
 
         response = client.models.generate_content(
             model=model,
-            contents=[uploaded, prompt],
+            contents=[
+                uploaded,
+                prompt,
+            ],
             config=types.GenerateContentConfig(
-                temperature=0
+                temperature=0,
             ),
         )
 
-        data = _extract_json(response.text or "")
+        data = _extract_json(
+            response.text or ""
+        )
 
-        relative_end = float(data["reading_end_sec"])
+    # ------------------------------------------------------------
+    # 5. Read Gemini's CLIP-RELATIVE timestamp
+    # ------------------------------------------------------------
 
-        if relative_end < 0 or relative_end > window_sec + 2:
-            raise RuntimeError(
-                f"Gemini returned invalid end timestamp "
-                f"{relative_end:.3f}s for {audio_path.name}"
+    relative_end = float(
+        data["reading_end_sec"]
+    )
+
+    # Small tolerance for model rounding.
+    tolerance = 1.0
+
+    if (
+        relative_end < 0
+        or relative_end > preview_duration + tolerance
+    ):
+        raise RuntimeError(
+            f"Gemini returned invalid end timestamp "
+            f"{relative_end:.3f}s for {audio_path.name}. "
+            f"Tail preview duration is "
+            f"{preview_duration:.3f}s."
+        )
+
+    # Clamp tiny rounding overshoot.
+    relative_end = min(
+        relative_end,
+        preview_duration,
+    )
+
+    # ------------------------------------------------------------
+    # 6. Convert preview-relative time -> original-file time
+    # ------------------------------------------------------------
+
+    absolute_end = (
+        tail_start
+        + relative_end
+    )
+
+    absolute_end = min(
+        absolute_end,
+        total_duration,
+    )
+
+    # ------------------------------------------------------------
+    # 7. Return ORIGINAL AUDIO timestamp
+    # ------------------------------------------------------------
+
+    return {
+        "reading_end_sec": absolute_end,
+        "closing_words": data.get(
+            "closing_words",
+            "",
+        ),
+        "confidence": float(
+            data.get(
+                "confidence",
+                0,
             )
+        ),
+        "reason": data.get(
+            "reason",
+            "",
+        ),
 
-        absolute_end = tail_start + relative_end
-
-        # Never allow an end timestamp beyond the source file.
-        absolute_end = min(
-            absolute_end,
-            total_duration,
-        )
-
-        return {
-            "reading_end_sec": absolute_end,
-            "relative_end_sec": relative_end,
-            "tail_start_sec": tail_start,
-            "audio_duration_sec": total_duration,
-            "closing_words": data.get("closing_words"),
-            "confidence": float(
-                data.get("confidence", 0)
-            ),
-            "reason": data.get("reason"),
-        }
+        # Helpful debugging metadata
+        "tail_start_sec": tail_start,
+        "relative_end_sec": relative_end,
+        "source_duration_sec": total_duration,
+    }
 
 def transcribe_words(
     audio_path: Path,
