@@ -35,10 +35,9 @@ if grep -RInE \
 fi
 
 echo "==> 6. Secret pattern check"
-echo "==> 6. Secret pattern check"
 
 if git grep -n -E \
-  'GEMINI_API_KEY[[:space:]]*=[[:space:]]*["'"'"'][^$][^"'"'"']{8,}["'"'"']' \
+  'GEMINI_API_KEY[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']{8,}["'"'"']' \
   -- \
   ':!README.md' \
   ':!project.example.yaml' \
