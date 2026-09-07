@@ -172,9 +172,9 @@ def detect_reading_end(
     Analyze only the end portion of an audio file and locate where the
     actual narration/scripture ends.
 
-    Gemini timestamps are relative to the tail preview clip.
-    This function converts them back to absolute timestamps in the
-    original audio file.
+    Gemini timestamps must be relative to the tail preview clip.
+    Invalid/out-of-range timestamps are retried before failing.
+    The final timestamp is converted back to the original audio timeline.
     """
 
     client = _client()
@@ -222,6 +222,12 @@ def detect_reading_end(
         total_duration - preview_duration,
     )
 
+    # Gemini sometimes rounds slightly past the clip boundary.
+    tolerance = 1.0
+
+    # Initial request + 2 correction retries.
+    max_attempts = 3
+
     # ------------------------------------------------------------
     # 3. Extract tail preview
     # ------------------------------------------------------------
@@ -255,25 +261,31 @@ def detect_reading_end(
         )
 
         # --------------------------------------------------------
-        # 4. Ask Gemini for a timestamp RELATIVE TO THIS CLIP
+        # 4. Base prompt
         # --------------------------------------------------------
 
-        prompt = f"""
-You are analyzing ONLY the final {preview_duration:.3f} seconds of a narration audio file.
+        base_prompt = f"""
+You are analyzing a SHORT AUDIO CLIP extracted from the end of a longer
+narration audio file.
 
-IMPORTANT TIMESTAMP RULE:
+The provided audio clip is approximately {preview_duration:.3f} seconds long.
 
-The audio clip provided to you starts at 0.000 seconds.
+CRITICAL TIMESTAMP RULE:
 
-ALL timestamps you return MUST be relative to THIS PROVIDED CLIP.
+Treat the FIRST AUDIO SAMPLE of the PROVIDED CLIP as timestamp 0.000.
 
-Do NOT return a timestamp from the original full audio file.
+You do NOT know and must NOT infer the timestamp of this clip within the
+original audio file.
 
-Your valid timestamp range is:
+ALL timestamps must be relative ONLY to the PROVIDED CLIP.
 
-0.000 to {preview_duration:.3f} seconds
+The ONLY valid range for reading_end_sec is:
 
-The end of the audio may contain spoken material such as:
+0.000 <= reading_end_sec <= {preview_duration:.3f}
+
+Any number greater than {preview_duration:.3f} is INVALID.
+
+The end of the clip may contain spoken material such as:
 
 - "End of Chapter 1"
 - "End of Chapter 1 to 3"
@@ -292,12 +304,12 @@ For Bible audiobook material, identify the point immediately after the
 final spoken word of the actual Scripture text and BEFORE any closing
 announcement such as "End of Chapter".
 
-For example:
+Example:
 
 "... Grace be with you. Amen.
 End of Chapter 1."
 
-The returned timestamp should point immediately after "Amen" and before
+The timestamp should point immediately after "Amen" and before
 "End of Chapter 1".
 
 If there is no spoken closing metadata, return the end of the actual
@@ -312,57 +324,154 @@ Return ONLY JSON with exactly these keys:
   "reason": string
 }}
 
-"reading_end_sec" MUST be measured from the beginning of THIS PROVIDED
-CLIP, where the clip begins at 0.000 seconds.
+Before returning the JSON, verify that reading_end_sec is between
+0.000 and {preview_duration:.3f}.
 
 Do not use markdown.
 """.strip()
 
-        response = client.models.generate_content(
-            model=model,
-            contents=[
-                uploaded,
-                prompt,
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0,
-            ),
-        )
+        data: dict[str, Any] | None = None
+        relative_end: float | None = None
+        previous_invalid: float | None = None
 
-        data = _extract_json(
-            response.text or ""
-        )
+        # --------------------------------------------------------
+        # 5. Ask Gemini, retrying invalid timestamps
+        # --------------------------------------------------------
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt == 1:
+                prompt = base_prompt
+            else:
+                prompt = f"""
+Your previous answer was INVALID.
+
+You returned:
+
+reading_end_sec = {previous_invalid:.3f}
+
+But the PROVIDED AUDIO CLIP is only approximately
+{preview_duration:.3f} seconds long.
+
+Therefore {previous_invalid:.3f} CANNOT be a valid timestamp for this clip.
+
+Analyze the PROVIDED AUDIO CLIP again from the beginning.
+
+IMPORTANT:
+
+- The beginning of THIS PROVIDED CLIP is 0.000 seconds.
+- Do NOT use a timestamp from the original full audio file.
+- Do NOT add any offset.
+- Do NOT infer where this clip came from.
+- Do NOT return a value greater than {preview_duration:.3f}.
+- Locate the final word of the actual narration/scripture.
+- Exclude "End of Chapter", credits, announcements, and other metadata.
+
+Your answer MUST satisfy:
+
+0.000 <= reading_end_sec <= {preview_duration:.3f}
+
+Return ONLY JSON:
+
+{{
+  "reading_end_sec": number,
+  "closing_words": string,
+  "confidence": number from 0 to 1,
+  "reason": string
+}}
+
+Check the timestamp range before answering.
+Do not use markdown.
+""".strip()
+
+            response = client.models.generate_content(
+                model=model,
+                contents=[
+                    uploaded,
+                    prompt,
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                ),
+            )
+
+            try:
+                candidate = _extract_json(
+                    response.text or ""
+                )
+
+                candidate_end = float(
+                    candidate["reading_end_sec"]
+                )
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                if attempt >= max_attempts:
+                    raise RuntimeError(
+                        f"Gemini returned an invalid end detection "
+                        f"response for {audio_path.name} after "
+                        f"{max_attempts} attempts."
+                    ) from exc
+
+                continue
+
+            # ----------------------------------------------------
+            # Valid timestamp
+            # ----------------------------------------------------
+
+            if (
+                candidate_end >= 0
+                and candidate_end
+                <= preview_duration + tolerance
+            ):
+                data = candidate
+
+                # Allow only tiny model rounding errors.
+                relative_end = min(
+                    candidate_end,
+                    preview_duration,
+                )
+
+                break
+
+            # ----------------------------------------------------
+            # Invalid timestamp -> retry
+            # ----------------------------------------------------
+
+            previous_invalid = candidate_end
+
+            if attempt < max_attempts:
+                print(
+                    f"    Gemini returned out-of-range end "
+                    f"timestamp {candidate_end:.3f}s "
+                    f"(valid: 0-{preview_duration:.3f}s); "
+                    f"retrying {attempt}/{max_attempts - 1}..."
+                )
+
+        # --------------------------------------------------------
+        # 6. Fail only after all attempts
+        # --------------------------------------------------------
+
+        if data is None or relative_end is None:
+            last_value = (
+                f"{previous_invalid:.3f}s"
+                if previous_invalid is not None
+                else "unknown"
+            )
+
+            raise RuntimeError(
+                f"Gemini returned invalid end timestamps "
+                f"for {audio_path.name} after "
+                f"{max_attempts} attempts. "
+                f"Last value: {last_value}. "
+                f"Tail preview duration is "
+                f"{preview_duration:.3f}s."
+            )
 
     # ------------------------------------------------------------
-    # 5. Read Gemini's CLIP-RELATIVE timestamp
-    # ------------------------------------------------------------
-
-    relative_end = float(
-        data["reading_end_sec"]
-    )
-
-    # Small tolerance for model rounding.
-    tolerance = 1.0
-
-    if (
-        relative_end < 0
-        or relative_end > preview_duration + tolerance
-    ):
-        raise RuntimeError(
-            f"Gemini returned invalid end timestamp "
-            f"{relative_end:.3f}s for {audio_path.name}. "
-            f"Tail preview duration is "
-            f"{preview_duration:.3f}s."
-        )
-
-    # Clamp tiny rounding overshoot.
-    relative_end = min(
-        relative_end,
-        preview_duration,
-    )
-
-    # ------------------------------------------------------------
-    # 6. Convert preview-relative time -> original-file time
+    # 7. Convert preview-relative -> original-file timestamp
     # ------------------------------------------------------------
 
     absolute_end = (
@@ -376,7 +485,7 @@ Do not use markdown.
     )
 
     # ------------------------------------------------------------
-    # 7. Return ORIGINAL AUDIO timestamp
+    # 8. Return ORIGINAL AUDIO timestamp
     # ------------------------------------------------------------
 
     return {
@@ -396,7 +505,7 @@ Do not use markdown.
             "",
         ),
 
-        # Helpful debugging metadata
+        # Debugging metadata
         "tail_start_sec": tail_start,
         "relative_end_sec": relative_end,
         "source_duration_sec": total_duration,
